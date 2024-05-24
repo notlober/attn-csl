@@ -1,0 +1,100 @@
+// Copyright 2024 Cerebras Systems.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// pe_program.csl
+param memcpy_params: comptime_struct;
+param N: i16;
+param d_k: i16;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const math = @import_module("<math>");
+
+var Q: [N * d_k]f32;
+var K: [N * d_k]f32;
+var V: [N * d_k]f32;
+var result: [N * d_k]f32;
+
+var Q_ptr: [*]f32 = &Q;
+var K_ptr: [*]f32 = &K;
+var V_ptr: [*]f32 = &V;
+const result_ptr: [*]f32 = &result;
+
+fn dot_product(q: *[d_k]f32, k: *[d_k]f32) f32 {
+  var sum: f32 = 0.0;
+  for (@range(i16, d_k)) |i| {
+    sum += (q.*)[i] * (k.*)[i];
+  }
+  return sum;
+}
+
+fn softmax(input: *[N]f32) void {
+  var max_val: f32 = math.NEGATIVE_INF_f32;
+  for (@range(i16, N)) |i| {
+    if ((input.*)[i] > max_val) {
+      max_val = (input.*)[i];
+    }
+  }
+
+  var sum: f32 = 0.0;
+  for (@range(i16, N)) |i| {
+    (input.*)[i] = math.exp_f32((input.*)[i] - max_val);
+    sum += (input.*)[i];
+  }
+
+  for (@range(i16, N)) |i| {
+    (input.*)[i] /= sum;
+  }
+}
+
+fn attention() void {
+  var attention_weights: [N]f32 = @zeros([N]f32);
+  for (@range(i16, N)) |i| {
+    const q = @ptrcast(*[d_k]f32, &Q[i * d_k]);
+    for (@range(i16, N)) |j| {
+      const k = @ptrcast(*[d_k]f32, &K[j * d_k]);
+      attention_weights[j] += dot_product(q, k);
+    }
+  }
+
+  // Scale the dot products
+  for (@range(i16, N)) |i| {
+    attention_weights[i] /= math.sqrt_f32(@as(f32, d_k));
+  }
+
+  softmax(&attention_weights);
+
+  for (@range(i16, N)) |i| {
+    const q = @ptrcast(*[d_k]f32, &Q[i * d_k]);
+    const res = @ptrcast(*[d_k]f32, &result[i * d_k]);
+    for (@range(i16, d_k)) |j| {
+      (res.*)[j] = 0.0;
+      for (@range(i16, N)) |k| {
+        (res.*)[j] += attention_weights[k] * V[k * d_k + j];
+      }
+    }
+  }
+}
+
+fn compute() void {
+  attention();
+  sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+  @export_symbol(Q_ptr, "Q");
+  @export_symbol(K_ptr, "K");
+  @export_symbol(V_ptr, "V");
+  @export_symbol(result_ptr, "result");
+  @export_symbol(compute);
+}
